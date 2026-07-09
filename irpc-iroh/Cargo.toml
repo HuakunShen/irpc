@@ -32,6 +32,7 @@ iroh-base.workspace = true
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
+iroh = { workspace = true, default-features = true }
 n0-future = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 irpc-derive = { version = "0.17.0", path = "../irpc-derive" }
