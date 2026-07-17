@@ -49,10 +49,8 @@ mod proto {
     };
     use irpc::{Client, WithChannels, channel::oneshot, rpc_requests};
     use irpc_iroh::{IrohRemoteConnection, read_request};
-    use n0_future::task::AbortOnDropHandle;
     use serde::{Deserialize, Serialize};
     use tokio::time::Instant;
-    use tracing::{info, warn};
 
     /// ALPN identifying this example protocol on the iroh endpoint.
     ///
@@ -100,21 +98,22 @@ mod proto {
     ///
     /// Binds an endpoint, registers the [`Server`] as the [`ProtocolHandler`] for [`ALPN`], and
     /// spawns the background [`Server::ping_loop`] that pings connected peers.
-    pub async fn server() -> Result<(Router, AbortOnDropHandle<()>)> {
+    pub async fn listen() -> Result<Router> {
         let endpoint = Endpoint::bind(presets::N0).await?;
         let server = Server::default();
+
         // The router drives `Server::accept` for every incoming connection on this ALPN.
-        let router = Router::builder(endpoint)
+        let router = Router::builder(endpoint.clone())
             .accept(ALPN, server.clone())
             .spawn();
         // Printed so the connecting side can be pointed at this peer.
         println!("endpoint id: {}", router.endpoint().id());
-        let ping_loop = tokio::spawn({
-            let server = server.clone();
-            server.ping_loop()
-        });
 
-        Ok((router, AbortOnDropHandle::new(ping_loop)))
+        // Spawn a loop that pings all clients once per second.
+        // The task is terminted once the endpoint closes through `Endpoint::closed`.
+        tokio::spawn(async move { endpoint.closed().run_until(server.ping_loop()).await });
+
+        Ok(router)
     }
 
     /// The listening state: a shared key-value store plus a registry of reverse clients.
@@ -123,9 +122,6 @@ mod proto {
         /// The key-value store that [`ClientToServer`] requests read and write.
         state: Arc<Mutex<BTreeMap<String, String>>>,
         /// A reverse [`irpc::Client`] per connected peer, used to send [`ServerToClient`] pings.
-        ///
-        /// Keyed by the peer's endpoint id so the ping loop can reach every live connection and
-        /// drop entries whose ping fails.
         clients: Arc<Mutex<HashMap<EndpointId, irpc::Client<ServerToClient>>>>,
     }
 
@@ -189,29 +185,22 @@ mod proto {
         async fn ping_loop(self) {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                // Hold the lock only for the synchronous fan-out: each iteration clones out what a
+                // Hold the lock only for a synchronous loop: each iteration clones out what a
                 // task needs and spawns it. The actual ping awaits happen inside those tasks, which
                 // own their clones, so the std mutex is never held across an await.
-                for (id, client) in self.clients.lock().unwrap().iter() {
-                    let id = *id;
+                for (&remote_id, client) in self.clients.lock().unwrap().iter() {
                     let client = client.clone();
                     let clients = self.clients.clone();
                     tokio::spawn(async move {
+                        // Send a `PingRequest` in to the client and await its reply.
+                        let short_id = remote_id.fmt_short();
                         let now = Instant::now();
-                        println!("ping {}...", id.fmt_short());
-                        // A plain request/response RPC in the server-to-client direction. It
-                        // resolves once the peer's accept loop answers the ping with a pong.
                         match client.rpc(PingRequest {}).await {
-                            Ok(()) => {
-                                println!("ping {}: OK ({:?})", id.fmt_short(), now.elapsed());
-                            }
+                            Ok(()) => println!("ping {short_id}: OK ({:?})", now.elapsed()),
                             Err(err) => {
-                                println!(
-                                    "ping {}: FAIL {err:#} ({:?})",
-                                    id.fmt_short(),
-                                    now.elapsed()
-                                );
-                                clients.lock().unwrap().remove(&id);
+                                // The ping failed. Remove the peer from our map of client connections.
+                                println!("ping {short_id}: FAIL {err:#} ({:?})", now.elapsed());
+                                clients.lock().unwrap().remove(&remote_id);
                             }
                         }
                     });
@@ -224,36 +213,39 @@ mod proto {
     ///
     /// Returns the endpoint (kept alive by the caller) and an [`irpc::Client`] for sending
     /// [`ClientToServer`] requests. It also spawns a background accept loop that answers the
-    /// listener's [`ServerToClient`] pings, so this side serves the reverse protocol too.
+    /// other peers's [`ServerToClient`] requests.
     pub async fn connect(endpoint_id: EndpointId) -> Result<(Endpoint, Client<ClientToServer>)> {
         println!("connecting to {endpoint_id}");
         let endpoint = Endpoint::bind(presets::N0).await?;
         let conn = endpoint.connect(endpoint_id, ALPN).await?;
-        // The outgoing client: opens `ClientToServer` streams to send get/set requests.
+        // The outgoing client with which we send `ClientToServerRequests` to the peer.
         let client = Client::boxed(IrohRemoteConnection::new(conn.clone()));
-        // The reverse accept loop, mirroring the listener's `accept`: it answers the pings the
-        // listener sends on this same connection. Detached into its own task so the caller can send
-        // its own requests concurrently; the returned endpoint keeps the connection alive.
-        let _accept_loop = tokio::spawn(async move {
-            // Wait for the next server-initiated request. `Ok(None)` is a clean close; an error
-            // means the connection dropped. Either way, stop serving.
-            while let Some(msg) = read_request::<ServerToClient>(&conn).await? {
-                match msg {
-                    ServerToClientMsg::Ping(msg) => {
-                        // Answer the ping by sending a unit on its response channel.
-                        let WithChannels { tx, .. } = msg;
-                        println!("Received ping from server, sending pong");
-                        if let Err(err) = tx.send(()).await {
-                            warn!("failed to send pong: {err:#}");
-                            break;
-                        }
-                    }
-                }
+        // Spawn a task that reads `ServerToClient` requests from the peer, on the same connection we
+        // use for outgoing requests. The task terminates once the connection closes.
+        tokio::spawn(async move {
+            if let Err(err) = pong_loop(conn).await {
+                println!("pong loop failed: {err:#}");
             }
-            info!("ping loop closed");
-            anyhow::Ok(())
         });
         Ok((endpoint, client))
+    }
+
+    /// Accepts RPC requests from the server and answers them.
+    async fn pong_loop(conn: Connection) -> Result<()> {
+        // Wait for the next server-initiated request. `Ok(None)` is a clean close; an error
+        // means the connection dropped. Either way, stop serving.
+        while let Some(msg) = read_request::<ServerToClient>(&conn).await? {
+            match msg {
+                ServerToClientMsg::Ping(msg) => {
+                    // Answer the ping by sending a unit on its response channel.
+                    let WithChannels { tx, .. } = msg;
+                    println!("Received ping from server, sending pong");
+                    tx.send(()).await?;
+                }
+            }
+        }
+        println!("ping loop closed: remote closed the connection");
+        anyhow::Ok(())
     }
 }
 
@@ -263,7 +255,7 @@ mod cli {
     use clap::Parser;
     use iroh::EndpointId;
 
-    use crate::proto::{GetRequest, SetRequest, connect, server};
+    use crate::proto::{GetRequest, SetRequest, connect, listen};
 
     /// Runs the example as either a listening or a connecting peer.
     #[derive(Debug, Parser)]
@@ -289,7 +281,8 @@ mod cli {
     pub async fn run() -> Result<()> {
         match Cli::parse() {
             Cli::Listen => {
-                let (router, _guard) = server().await?;
+                let router = listen().await?;
+                println!("waiting for ctrl-c");
                 tokio::signal::ctrl_c().await.ok();
                 router.shutdown().await?;
             }
