@@ -1,9 +1,4 @@
-use std::{
-    fmt,
-    future::Future,
-    io,
-    sync::{Arc, atomic::AtomicU64},
-};
+use std::{fmt, future::Future, io, sync::Arc};
 
 use iroh::{
     EndpointId,
@@ -25,6 +20,9 @@ use irpc::{
 };
 use n0_error::{Result, e};
 use n0_future::{TryFutureExt, future::Boxed as BoxFuture};
+// portable-atomic provides AtomicU64 on 32-bit targets (e.g. Xtensa ESP32) that
+// lack native 64-bit atomics, same as iroh itself.
+use portable_atomic::{AtomicU64, Ordering};
 use tracing::{Instrument, debug, error_span, trace, trace_span, warn};
 
 /// Returns a client that connects to a irpc service using an [`iroh::Endpoint`].
@@ -219,9 +217,7 @@ impl<S: Service> IrohProtocol<S> {
 impl<S: Service> ProtocolHandler for IrohProtocol<S> {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let handler = self.handler.clone();
-        let request_id = self
-            .request_id
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let request_id = self.request_id.fetch_add(1, Ordering::AcqRel);
         let fut = handle_connection::<S>(&connection, handler).map_err(AcceptError::from_err);
         let span = trace_span!("rpc", id = request_id);
         fut.instrument(span).await
@@ -267,9 +263,7 @@ impl<S: Service> ProtocolHandler for Iroh0RttProtocol<S> {
     async fn on_accepting(&self, accepting: Accepting) -> Result<Connection, AcceptError> {
         let zrtt_conn = accepting.into_0rtt();
         let handler = self.handler.clone();
-        let request_id = self
-            .request_id
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let request_id = self.request_id.fetch_add(1, Ordering::AcqRel);
         handle_connection::<S>(&zrtt_conn, handler)
             .map_err(AcceptError::from_err)
             .instrument(trace_span!("rpc", id = request_id))
