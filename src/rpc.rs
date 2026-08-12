@@ -809,6 +809,63 @@ pub async fn read_request_raw_with_limits<S: Service>(
         .map(|(msg, _carrier, rx, tx)| (msg, rx, tx)))
 }
 
+/// Reads one already-accepted bidirectional stream using the same official
+/// iRPC framing and decoder as connection-oriented requests.
+///
+/// Fabric-owned transports use this entry point after authorization has
+/// already selected exactly one stream; it does not open another stream or
+/// inspect an endpoint. The announced length is checked before allocation.
+pub async fn read_request_from_stream_with_limits<S: RemoteService>(
+    recv: noq::RecvStream,
+    send: noq::SendStream,
+    limits: RemoteLimits,
+) -> std::io::Result<S::Message> {
+    let (msg, carrier, rx, tx) = read_request_stream_inner::<S>(recv, send, limits).await?;
+    Ok(crate::span_propagation::scope_remote(carrier, async move {
+        S::with_remote_channels_with_limits(msg, rx, tx, limits)
+    })
+    .await)
+}
+
+async fn read_request_stream_inner<S: Service>(
+    recv: noq::RecvStream,
+    send: noq::SendStream,
+    limits: RemoteLimits,
+) -> std::io::Result<(
+    S,
+    Option<crate::span_propagation::SpanContextCarrier>,
+    noq::RecvStream,
+    noq::SendStream,
+)> {
+    let mut recv = recv;
+    let size = recv
+        .read_varint_u64()
+        .await?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "failed to read size"))?;
+    if size > limits.max_message_bytes {
+        recv.stop(ERROR_CODE_MAX_MESSAGE_SIZE_EXCEEDED.into()).ok();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request exceeded max message size",
+        ));
+    }
+    let mut buf = vec![0; size as usize];
+    recv.read_exact(&mut buf)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::UnexpectedEof, e))?;
+
+    let (carrier, msg): (Option<crate::span_propagation::SpanContextCarrier>, S) =
+        if S::SPAN_PROPAGATION {
+            postcard::from_bytes(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        } else {
+            let msg = postcard::from_bytes(&buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            (None, msg)
+        };
+
+    Ok((msg, carrier, recv, send))
+}
+
 /// Internal: read a request and also return the propagated span context carrier.
 ///
 /// The carrier is `Some` iff `S::SPAN_PROPAGATION` is true and the remote sent one.
