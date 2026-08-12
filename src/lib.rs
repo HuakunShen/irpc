@@ -448,6 +448,27 @@ where
     }
 }
 
+/// Tuple conversion from inner message and remote tx/rx channels with an
+/// explicit per-remote limit.
+#[cfg(feature = "rpc")]
+impl<I: Channels<S>, S: Service, Tx, Rx> From<(I, Tx, Rx, rpc::RemoteLimits)> for WithChannels<I, S>
+where
+    I: Channels<S>,
+    <I as Channels<S>>::Tx: From<(Tx, rpc::RemoteLimits)>,
+    <I as Channels<S>>::Rx: From<(Rx, rpc::RemoteLimits)>,
+{
+    fn from(inner: (I, Tx, Rx, rpc::RemoteLimits)) -> Self {
+        let (inner, tx, rx, limits) = inner;
+        Self {
+            inner,
+            tx: (tx, limits).into(),
+            rx: (rx, limits).into(),
+            #[cfg(feature = "spans")]
+            span: tracing::Span::current(),
+        }
+    }
+}
+
 /// Tuple conversion from inner message and tx channel to a WithChannels struct
 ///
 /// For the very common case where you just need a tx channel to send the response to.
@@ -541,7 +562,16 @@ impl<S: Service> Client<S> {
     /// and a socket `addr` of the remote service.
     #[cfg(feature = "rpc")]
     pub fn noq(endpoint: noq::Endpoint, addr: std::net::SocketAddr) -> Self {
-        Self::boxed(rpc::NoqLazyRemoteConnection::new(endpoint, addr))
+        Self::noq_with_limits(endpoint, addr, rpc::RemoteLimits::default())
+    }
+
+    #[cfg(feature = "rpc")]
+    pub fn noq_with_limits(
+        endpoint: noq::Endpoint,
+        addr: std::net::SocketAddr,
+        limits: rpc::RemoteLimits,
+    ) -> Self {
+        Self::boxed_with_limits(rpc::NoqLazyRemoteConnection::new(endpoint, addr), limits)
     }
 
     /// Create a new client from a `rpc::RemoteConnection` trait object.
@@ -549,7 +579,15 @@ impl<S: Service> Client<S> {
     /// such as the iroh transport.
     #[cfg(feature = "rpc")]
     pub fn boxed(remote: impl rpc::RemoteConnection) -> Self {
-        Self(ClientInner::Remote(Box::new(remote)), PhantomData)
+        Self::boxed_with_limits(remote, rpc::RemoteLimits::default())
+    }
+
+    #[cfg(feature = "rpc")]
+    pub fn boxed_with_limits(
+        remote: impl rpc::RemoteConnection,
+        limits: rpc::RemoteLimits,
+    ) -> Self {
+        Self(ClientInner::Remote(Box::new(remote), limits), PhantomData)
     }
 
     /// Creates a new client from a `tokio::sync::mpsc::Sender`.
@@ -587,14 +625,18 @@ impl<S: Service> Client<S> {
         {
             let cloned = match &self.0 {
                 ClientInner::Local(tx) => Request::Local(tx.clone()),
-                ClientInner::Remote(connection) => Request::Remote(connection.clone_boxed()),
+                ClientInner::Remote(connection, limits) => {
+                    Request::Remote((connection.clone_boxed(), *limits))
+                }
             };
             async move {
                 match cloned {
                     Request::Local(tx) => Ok(Request::Local(tx.into())),
-                    Request::Remote(conn) => {
-                        let (send, recv) = conn.open_bi().await?;
-                        Ok(Request::Remote(rpc::RemoteSender::new(send, recv)))
+                    Request::Remote((conn, limits)) => {
+                        let (send, recv) = conn.open_bi_with_limits(limits).await?;
+                        Ok(Request::Remote(rpc::RemoteSender::new_with_limits(
+                            send, recv, limits,
+                        )))
                     }
                 }
             }
@@ -637,8 +679,8 @@ impl<S: Service> Client<S> {
                     Request::Remote(_request) => unreachable!(),
                     #[cfg(feature = "rpc")]
                     Request::Remote(request) => {
-                        let (tx, rx) = request.write(msg).await?;
-                        (tx.into(), rx.into())
+                        let (tx, rx, limits) = request.write_with_limits(msg).await?;
+                        ((tx, limits).into(), (rx, limits).into())
                     }
                 };
             Ok((update_tx, res_rx))
@@ -676,8 +718,8 @@ impl<S: Service> Client<S> {
                     Request::Remote(_request) => unreachable!(),
                     #[cfg(feature = "rpc")]
                     Request::Remote(request) => {
-                        let (tx, rx) = request.write(msg).await?;
-                        (tx.into(), rx.into())
+                        let (tx, rx, limits) = request.write_with_limits(msg).await?;
+                        ((tx, limits).into(), (rx, limits).into())
                     }
                 };
             Ok((update_tx, res_rx))
@@ -719,14 +761,18 @@ impl<S: Service> Client<S> {
                 #[cfg(feature = "rpc")]
                 Request::Remote(request) => {
                     // see https://www.iroh.computer/blog/0rtt-api#connect-side
-                    let buf = rpc::prepare_write::<S>(msg)?;
-                    let (_tx, _rx) = request.write_raw(&buf).await?;
+                    let limits = match &this.0 {
+                        ClientInner::Remote(_, limits) => *limits,
+                        ClientInner::Local(_) => rpc::RemoteLimits::default(),
+                    };
+                    let buf = rpc::prepare_write_with_limits::<S>(msg, limits)?;
+                    let (_tx, _rx, _limits) = request.write_raw_with_limits(&buf).await?;
                     if this.0.zero_rtt_rejected().await {
                         // 0rtt was not accepted, the data is lost, send it again!
                         let Request::Remote(request) = this.request().await? else {
                             unreachable!()
                         };
-                        let (_tx, _rx) = request.write_raw(&buf).await?;
+                        let (_tx, _rx, _limits) = request.write_raw_with_limits(&buf).await?;
                     }
                 }
             };
@@ -758,17 +804,21 @@ impl<S: Service> Client<S> {
                 #[cfg(feature = "rpc")]
                 Request::Remote(request) => {
                     // see https://www.iroh.computer/blog/0rtt-api#connect-side
-                    let buf = rpc::prepare_write::<S>(msg)?;
-                    let (_tx, rx) = request.write_raw(&buf).await?;
+                    let limits = match &this.0 {
+                        ClientInner::Remote(_, limits) => *limits,
+                        ClientInner::Local(_) => rpc::RemoteLimits::default(),
+                    };
+                    let buf = rpc::prepare_write_with_limits::<S>(msg, limits)?;
+                    let (_tx, rx, _limits) = request.write_raw_with_limits(&buf).await?;
                     if this.0.zero_rtt_rejected().await {
                         // 0rtt was not accepted, the data is lost, send it again!
                         let Request::Remote(request) = this.request().await? else {
                             unreachable!()
                         };
-                        let (_tx, rx) = request.write_raw(&buf).await?;
-                        rx
+                        let (_tx, rx, _limits) = request.write_raw_with_limits(&buf).await?;
+                        (rx, limits)
                     } else {
-                        rx
+                        (rx, limits)
                     }
                     .into()
                 }
@@ -806,17 +856,21 @@ impl<S: Service> Client<S> {
                 #[cfg(feature = "rpc")]
                 Request::Remote(request) => {
                     // see https://www.iroh.computer/blog/0rtt-api#connect-side
-                    let buf = rpc::prepare_write::<S>(msg)?;
-                    let (_tx, rx) = request.write_raw(&buf).await?;
+                    let limits = match &this.0 {
+                        ClientInner::Remote(_, limits) => *limits,
+                        ClientInner::Local(_) => rpc::RemoteLimits::default(),
+                    };
+                    let buf = rpc::prepare_write_with_limits::<S>(msg, limits)?;
+                    let (_tx, rx, _limits) = request.write_raw_with_limits(&buf).await?;
                     if this.0.zero_rtt_rejected().await {
                         // 0rtt was not accepted, the data is lost, send it again!
                         let Request::Remote(request) = this.request().await? else {
                             unreachable!()
                         };
-                        let (_tx, rx) = request.write_raw(&buf).await?;
-                        rx
+                        let (_tx, rx, _limits) = request.write_raw_with_limits(&buf).await?;
+                        (rx, limits)
                     } else {
-                        rx
+                        (rx, limits)
                     }
                     .into()
                 }
@@ -869,7 +923,7 @@ impl<S: Service> Client<S> {
 pub(crate) enum ClientInner<M> {
     Local(crate::channel::mpsc::Sender<M>),
     #[cfg(feature = "rpc")]
-    Remote(Box<dyn rpc::RemoteConnection>),
+    Remote(Box<dyn rpc::RemoteConnection>, rpc::RemoteLimits),
     #[cfg(not(feature = "rpc"))]
     #[allow(dead_code)]
     Remote(PhantomData<M>),
@@ -880,7 +934,7 @@ impl<M> Clone for ClientInner<M> {
         match self {
             Self::Local(tx) => Self::Local(tx.clone()),
             #[cfg(feature = "rpc")]
-            Self::Remote(conn) => Self::Remote(conn.clone_boxed()),
+            Self::Remote(conn, limits) => Self::Remote(conn.clone_boxed(), *limits),
             #[cfg(not(feature = "rpc"))]
             Self::Remote(_) => unreachable!(),
         }
@@ -893,7 +947,9 @@ impl<M> ClientInner<M> {
         match self {
             ClientInner::Local(_sender) => false,
             #[cfg(feature = "rpc")]
-            ClientInner::Remote(remote_connection) => remote_connection.zero_rtt_rejected().await,
+            ClientInner::Remote(remote_connection, _limits) => {
+                remote_connection.zero_rtt_rejected().await
+            }
             #[cfg(not(feature = "rpc"))]
             Self::Remote(_) => unreachable!(),
         }

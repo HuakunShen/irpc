@@ -166,7 +166,7 @@ async fn limited_vec_receiver(server: Endpoint) -> Result<(), RecvError> {
         .await
         .map_err(|err| e!(RecvError::Io, err.into()))?;
     let recv = oneshot::Receiver::<Vec<u8>>::from((recv, RemoteLimits::new(64 * 1024)));
-    recv.await
+    recv.await.map(|_| ())
 }
 
 #[tokio::test]

@@ -294,6 +294,9 @@ async fn mpsc_remote_limit_recv() -> TestResult<()> {
     let Err(cause) = server.await? else {
         panic!("server should have failed due to the configured remote limit");
     };
-    assert!(matches!(cause, mpsc::RecvError::MaxMessageSizeExceeded { .. }));
+    assert!(matches!(
+        cause,
+        mpsc::RecvError::MaxMessageSizeExceeded { .. }
+    ));
     Ok(())
 }

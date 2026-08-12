@@ -29,6 +29,30 @@ use crate::{
 /// Default max message size (16 MiB).
 pub const MAX_MESSAGE_SIZE: u64 = 1024 * 1024 * 16;
 
+/// Per-remote limits applied before any inbound message buffer is allocated.
+///
+/// The default preserves the historical MAX_MESSAGE_SIZE behavior. A caller
+/// that owns a remote connection can select a smaller limit for that
+/// connection without changing the process-wide default.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteLimits {
+    /// Maximum serialized message payload in bytes.
+    pub max_message_bytes: u64,
+}
+
+impl RemoteLimits {
+    /// Creates limits for a remote connection.
+    pub const fn new(max_message_bytes: u64) -> Self {
+        Self { max_message_bytes }
+    }
+}
+
+impl Default for RemoteLimits {
+    fn default() -> Self {
+        Self::new(MAX_MESSAGE_SIZE)
+    }
+}
+
 /// Error code on streams if the max message size was exceeded.
 pub const ERROR_CODE_MAX_MESSAGE_SIZE_EXCEEDED: u32 = 1;
 
@@ -112,6 +136,18 @@ pub trait RemoteConnection: Send + Sync + Debug + 'static {
     fn open_bi(
         &self,
     ) -> BoxFuture<std::result::Result<(noq::SendStream, noq::RecvStream), RequestError>>;
+
+    /// Open a bidirectional stream using the limits selected by the caller.
+    ///
+    /// The default implementation preserves compatibility for transports that
+    /// do not need the limits while the RPC layer enforces them at message
+    /// boundaries.
+    fn open_bi_with_limits(
+        &self,
+        _limits: RemoteLimits,
+    ) -> BoxFuture<std::result::Result<(noq::SendStream, noq::RecvStream), RequestError>> {
+        self.open_bi()
+    }
 
     /// Returns whether 0-RTT data was rejected by the server.
     ///
@@ -213,16 +249,14 @@ async fn connect_and_open_bi(
 pub struct RemoteSender<S>(
     noq::SendStream,
     noq::RecvStream,
+    RemoteLimits,
     std::marker::PhantomData<S>,
 );
 
-/// Serialize a message for sending over the wire.
-///
-/// When `S::SPAN_PROPAGATION` is true, the message is wrapped in a tuple with
-/// span context: `(Option<SpanContextCarrier>, msg)`.
-/// When false, the message is serialized directly.
-pub(crate) fn prepare_write<S: Service>(
+/// Serialize a message using an explicit per-remote size limit.
+pub(crate) fn prepare_write_with_limits<S: Service>(
     msg: impl Into<S>,
+    limits: RemoteLimits,
 ) -> Result<SmallVec<[u8; 128]>, WriteError> {
     let msg = msg.into();
     let mut buf = SmallVec::<[u8; 128]>::new();
@@ -231,13 +265,13 @@ pub(crate) fn prepare_write<S: Service>(
         // Include span context in wire format
         let span_ctx = Some(crate::span_propagation::SpanContextCarrier::from_current());
         let payload = (span_ctx, msg);
-        if postcard::experimental::serialized_size(&payload)? as u64 > MAX_MESSAGE_SIZE {
+        if postcard::experimental::serialized_size(&payload)? as u64 > limits.max_message_bytes {
             return Err(e!(WriteError::MaxMessageSizeExceeded));
         }
         buf.write_length_prefixed(&payload)?;
     } else {
         // Original wire format without span context
-        if postcard::experimental::serialized_size(&msg)? as u64 > MAX_MESSAGE_SIZE {
+        if postcard::experimental::serialized_size(&msg)? as u64 > limits.max_message_bytes {
             return Err(e!(WriteError::MaxMessageSizeExceeded));
         }
         buf.write_length_prefixed(&msg)?;
@@ -248,35 +282,60 @@ pub(crate) fn prepare_write<S: Service>(
 
 impl<S: Service> RemoteSender<S> {
     pub fn new(send: noq::SendStream, recv: noq::RecvStream) -> Self {
-        Self(send, recv, PhantomData)
+        Self::new_with_limits(send, recv, RemoteLimits::default())
+    }
+
+    pub fn new_with_limits(
+        send: noq::SendStream,
+        recv: noq::RecvStream,
+        limits: RemoteLimits,
+    ) -> Self {
+        Self(send, recv, limits, PhantomData)
     }
 
     pub async fn write(
         self,
         msg: impl Into<S>,
     ) -> std::result::Result<(noq::SendStream, noq::RecvStream), WriteError> {
-        let buf = prepare_write(msg)?;
-        self.write_raw(&buf).await
+        self.write_with_limits(msg)
+            .await
+            .map(|(send, recv, _limits)| (send, recv))
     }
 
-    pub(crate) async fn write_raw(
+    pub(crate) async fn write_with_limits(
+        self,
+        msg: impl Into<S>,
+    ) -> std::result::Result<(noq::SendStream, noq::RecvStream, RemoteLimits), WriteError> {
+        let limits = self.2;
+        let buf = prepare_write_with_limits(msg, limits)?;
+        let (send, recv, _limits) = self.write_raw_with_limits(&buf).await?;
+        Ok((send, recv, limits))
+    }
+
+    pub(crate) async fn write_raw_with_limits(
         self,
         buf: &[u8],
-    ) -> std::result::Result<(noq::SendStream, noq::RecvStream), WriteError> {
-        let RemoteSender(mut send, recv, _) = self;
+    ) -> std::result::Result<(noq::SendStream, noq::RecvStream, RemoteLimits), WriteError> {
+        let RemoteSender(mut send, recv, limits, _) = self;
         send.write_all(buf).await?;
-        Ok((send, recv))
+        Ok((send, recv, limits))
     }
 }
 
 impl<T: DeserializeOwned> From<noq::RecvStream> for oneshot::Receiver<T> {
-    fn from(mut read: noq::RecvStream) -> Self {
+    fn from(read: noq::RecvStream) -> Self {
+        Self::from((read, RemoteLimits::default()))
+    }
+}
+
+impl<T: DeserializeOwned> From<(noq::RecvStream, RemoteLimits)> for oneshot::Receiver<T> {
+    fn from((mut read, limits): (noq::RecvStream, RemoteLimits)) -> Self {
         let fut = async move {
             let size = read.read_varint_u64().await?.ok_or(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "failed to read size",
             ))?;
-            if size > MAX_MESSAGE_SIZE {
+            if size > limits.max_message_bytes {
                 read.stop(ERROR_CODE_MAX_MESSAGE_SIZE_EXCEEDED.into()).ok();
                 return Err(e!(oneshot::RecvError::MaxMessageSizeExceeded));
             }
@@ -294,6 +353,12 @@ impl<T: DeserializeOwned> From<noq::RecvStream> for oneshot::Receiver<T> {
 
 impl From<noq::RecvStream> for crate::channel::none::NoReceiver {
     fn from(read: noq::RecvStream) -> Self {
+        Self::from((read, RemoteLimits::default()))
+    }
+}
+
+impl From<(noq::RecvStream, RemoteLimits)> for crate::channel::none::NoReceiver {
+    fn from((read, _limits): (noq::RecvStream, RemoteLimits)) -> Self {
         drop(read);
         Self
     }
@@ -301,8 +366,15 @@ impl From<noq::RecvStream> for crate::channel::none::NoReceiver {
 
 impl<T: RpcMessage> From<noq::RecvStream> for mpsc::Receiver<T> {
     fn from(read: noq::RecvStream) -> Self {
+        Self::from((read, RemoteLimits::default()))
+    }
+}
+
+impl<T: RpcMessage> From<(noq::RecvStream, RemoteLimits)> for mpsc::Receiver<T> {
+    fn from((read, limits): (noq::RecvStream, RemoteLimits)) -> Self {
         mpsc::Receiver::Boxed(Box::new(NoqReceiver {
             recv: read,
+            limits,
             _marker: PhantomData,
         }))
     }
@@ -310,13 +382,25 @@ impl<T: RpcMessage> From<noq::RecvStream> for mpsc::Receiver<T> {
 
 impl From<noq::SendStream> for NoSender {
     fn from(write: noq::SendStream) -> Self {
+        Self::from((write, RemoteLimits::default()))
+    }
+}
+
+impl From<(noq::SendStream, RemoteLimits)> for NoSender {
+    fn from((write, _limits): (noq::SendStream, RemoteLimits)) -> Self {
         let _ = write;
         NoSender
     }
 }
 
 impl<T: RpcMessage> From<noq::SendStream> for oneshot::Sender<T> {
-    fn from(mut writer: noq::SendStream) -> Self {
+    fn from(writer: noq::SendStream) -> Self {
+        Self::from((writer, RemoteLimits::default()))
+    }
+}
+
+impl<T: RpcMessage> From<(noq::SendStream, RemoteLimits)> for oneshot::Sender<T> {
+    fn from((mut writer, limits): (noq::SendStream, RemoteLimits)) -> Self {
         oneshot::Sender::Boxed(Box::new(move |value| {
             Box::pin(async move {
                 let size = match postcard::experimental::serialized_size(&value) {
@@ -329,7 +413,7 @@ impl<T: RpcMessage> From<noq::SendStream> for oneshot::Sender<T> {
                         ));
                     }
                 };
-                if size as u64 > MAX_MESSAGE_SIZE {
+                if size as u64 > limits.max_message_bytes {
                     writer
                         .reset(ERROR_CODE_MAX_MESSAGE_SIZE_EXCEEDED.into())
                         .ok();
@@ -350,9 +434,16 @@ impl<T: RpcMessage> From<noq::SendStream> for oneshot::Sender<T> {
 
 impl<T: RpcMessage> From<noq::SendStream> for mpsc::Sender<T> {
     fn from(write: noq::SendStream) -> Self {
+        Self::from((write, RemoteLimits::default()))
+    }
+}
+
+impl<T: RpcMessage> From<(noq::SendStream, RemoteLimits)> for mpsc::Sender<T> {
+    fn from((write, limits): (noq::SendStream, RemoteLimits)) -> Self {
         mpsc::Sender::Boxed(Arc::new(NoqSender(tokio::sync::Mutex::new(
             NoqSenderState::Open(NoqSenderInner {
                 send: write,
+                limits,
                 buffer: SmallVec::new(),
                 _marker: PhantomData,
             }),
@@ -362,6 +453,7 @@ impl<T: RpcMessage> From<noq::SendStream> for mpsc::Sender<T> {
 
 struct NoqReceiver<T> {
     recv: noq::RecvStream,
+    limits: RemoteLimits,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -376,11 +468,12 @@ impl<T: RpcMessage> DynReceiver<T> for NoqReceiver<T> {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<Option<T>, mpsc::RecvError>> + Send + Sync + '_>> {
         Box::pin(async {
+            let limits = self.limits;
             let read = &mut self.recv;
             let Some(size) = read.read_varint_u64().await? else {
                 return Ok(None);
             };
-            if size > MAX_MESSAGE_SIZE {
+            if size > limits.max_message_bytes {
                 self.recv
                     .stop(ERROR_CODE_MAX_MESSAGE_SIZE_EXCEEDED.into())
                     .ok();
@@ -403,6 +496,7 @@ impl<T> Drop for NoqReceiver<T> {
 
 struct NoqSenderInner<T> {
     send: noq::SendStream,
+    limits: RemoteLimits,
     buffer: SmallVec<[u8; 128]>,
     _marker: std::marker::PhantomData<T>,
 }
@@ -413,6 +507,7 @@ impl<T: RpcMessage> NoqSenderInner<T> {
         value: T,
     ) -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + Sync + '_>> {
         Box::pin(async {
+            let limits = self.limits;
             let size = match postcard::experimental::serialized_size(&value) {
                 Ok(size) => size,
                 Err(e) => {
@@ -423,7 +518,7 @@ impl<T: RpcMessage> NoqSenderInner<T> {
                     ));
                 }
             };
-            if size as u64 > MAX_MESSAGE_SIZE {
+            if size as u64 > limits.max_message_bytes {
                 self.send
                     .reset(ERROR_CODE_MAX_MESSAGE_SIZE_EXCEEDED.into())
                     .ok();
@@ -446,7 +541,8 @@ impl<T: RpcMessage> NoqSenderInner<T> {
         value: T,
     ) -> Pin<Box<dyn Future<Output = Result<bool, SendError>> + Send + Sync + '_>> {
         Box::pin(async {
-            if postcard::experimental::serialized_size(&value)? as u64 > MAX_MESSAGE_SIZE {
+            let limits = self.limits;
+            if postcard::experimental::serialized_size(&value)? as u64 > limits.max_message_bytes {
                 return Err(e!(SendError::MaxMessageSizeExceeded));
             }
             // todo: move the non-async part out of the box. Will require a new return type.
@@ -555,6 +651,16 @@ pub trait RemoteService: Service + Sized {
     /// with a pair of QUIC streams for `tx` and `rx` channels.
     fn with_remote_channels(self, rx: noq::RecvStream, tx: noq::SendStream) -> Self::Message;
 
+    /// Returns the message enum using the limit selected for this remote connection.
+    fn with_remote_channels_with_limits(
+        self,
+        rx: noq::RecvStream,
+        tx: noq::SendStream,
+        _limits: RemoteLimits,
+    ) -> Self::Message {
+        self.with_remote_channels(rx, tx)
+    }
+
     /// Creates a [`Handler`] that forwards all messages to a [`LocalSender`].
     fn remote_handler(local_sender: LocalSender<Self>) -> Handler<Self> {
         Arc::new(move |msg, rx, tx| {
@@ -564,6 +670,20 @@ pub trait RemoteService: Service + Sized {
             let local_sender = local_sender.clone();
             Box::pin(async move {
                 let msg = Self::with_remote_channels(msg, rx, tx);
+                local_sender.send_raw(msg).await
+            })
+        })
+    }
+
+    /// Creates a handler that applies an explicit limit to request channels.
+    fn remote_handler_with_limits(
+        local_sender: LocalSender<Self>,
+        limits: RemoteLimits,
+    ) -> Handler<Self> {
+        Arc::new(move |msg, rx, tx| {
+            let local_sender = local_sender.clone();
+            Box::pin(async move {
+                let msg = Self::with_remote_channels_with_limits(msg, rx, tx, limits);
                 local_sender.send_raw(msg).await
             })
         })
@@ -615,6 +735,14 @@ pub async fn handle_connection<S: Service>(
     connection: noq::Connection,
     handler: Handler<S>,
 ) -> io::Result<()> {
+    handle_connection_with_limits(connection, handler, RemoteLimits::default()).await
+}
+
+pub async fn handle_connection_with_limits<S: Service>(
+    connection: noq::Connection,
+    handler: Handler<S>,
+    limits: RemoteLimits,
+) -> io::Result<()> {
     let remote = connection
         .path(PathId::ZERO)
         .and_then(|p| p.remote_address().ok());
@@ -623,7 +751,8 @@ pub async fn handle_connection<S: Service>(
     }
     debug!("connection accepted");
     loop {
-        let Some((msg, carrier, rx, tx)) = read_request_inner::<S>(&connection).await? else {
+        let Some((msg, carrier, rx, tx)) = read_request_inner::<S>(&connection, limits).await?
+        else {
             return Ok(());
         };
         crate::span_propagation::scope_remote(carrier, handler(msg, rx, tx)).await?;
@@ -636,12 +765,19 @@ pub async fn handle_connection<S: Service>(
 pub async fn read_request<S: RemoteService>(
     connection: &noq::Connection,
 ) -> std::io::Result<Option<S::Message>> {
-    let Some((msg, carrier, rx, tx)) = read_request_inner::<S>(connection).await? else {
+    read_request_with_limits::<S>(connection, RemoteLimits::default()).await
+}
+
+pub async fn read_request_with_limits<S: RemoteService>(
+    connection: &noq::Connection,
+    limits: RemoteLimits,
+) -> std::io::Result<Option<S::Message>> {
+    let Some((msg, carrier, rx, tx)) = read_request_inner::<S>(connection, limits).await? else {
         return Ok(None);
     };
     Ok(Some(
         crate::span_propagation::scope_remote(carrier, async move {
-            S::with_remote_channels(msg, rx, tx)
+            S::with_remote_channels_with_limits(msg, rx, tx, limits)
         })
         .await,
     ))
@@ -661,7 +797,14 @@ pub async fn read_request<S: RemoteService>(
 pub async fn read_request_raw<S: Service>(
     connection: &noq::Connection,
 ) -> std::io::Result<Option<(S, noq::RecvStream, noq::SendStream)>> {
-    Ok(read_request_inner::<S>(connection)
+    read_request_raw_with_limits::<S>(connection, RemoteLimits::default()).await
+}
+
+pub async fn read_request_raw_with_limits<S: Service>(
+    connection: &noq::Connection,
+    limits: RemoteLimits,
+) -> std::io::Result<Option<(S, noq::RecvStream, noq::SendStream)>> {
+    Ok(read_request_inner::<S>(connection, limits)
         .await?
         .map(|(msg, _carrier, rx, tx)| (msg, rx, tx)))
 }
@@ -671,6 +814,7 @@ pub async fn read_request_raw<S: Service>(
 /// The carrier is `Some` iff `S::SPAN_PROPAGATION` is true and the remote sent one.
 async fn read_request_inner<S: Service>(
     connection: &noq::Connection,
+    limits: RemoteLimits,
 ) -> std::io::Result<
     Option<(
         S,
@@ -694,7 +838,7 @@ async fn read_request_inner<S: Service>(
         .read_varint_u64()
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "failed to read size"))?;
-    if size > MAX_MESSAGE_SIZE {
+    if size > limits.max_message_bytes {
         connection.close(
             ERROR_CODE_MAX_MESSAGE_SIZE_EXCEEDED.into(),
             b"request exceeded max message size",

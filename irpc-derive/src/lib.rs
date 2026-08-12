@@ -328,6 +328,29 @@ fn generate_remote_service_impl(
             }
         });
 
+    let variants_with_limits = variants_with_attr
+        .iter()
+        .map(|(variant_name, _inner_type)| {
+            let span_name = variant_name.to_string();
+
+            if span_propagation {
+                quote! {
+                    #proto_enum_name::#variant_name(msg) => {
+                        let span = ::tracing::info_span!(#span_name);
+                        ::irpc::span_propagation::set_span_parent_from_remote(&span);
+                        let _guard = span.enter();
+                        #message_enum_name::from(::irpc::WithChannels::from((msg, tx, rx, limits)))
+                    }
+                }
+            } else {
+                quote! {
+                    #proto_enum_name::#variant_name(msg) => {
+                        #message_enum_name::from(::irpc::WithChannels::from((msg, tx, rx, limits)))
+                    }
+                }
+            }
+        });
+
     quote! {
         impl ::irpc::rpc::RemoteService for #proto_enum_name {
             fn with_remote_channels(
@@ -337,6 +360,17 @@ fn generate_remote_service_impl(
             ) -> Self::Message {
                 match self {
                     #(#variants),*
+                }
+            }
+
+            fn with_remote_channels_with_limits(
+                self,
+                rx: ::irpc::rpc::noq::RecvStream,
+                tx: ::irpc::rpc::noq::SendStream,
+                limits: ::irpc::rpc::RemoteLimits
+            ) -> Self::Message {
+                match self {
+                    #(#variants_with_limits),*
                 }
             }
         }

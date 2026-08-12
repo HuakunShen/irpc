@@ -13,7 +13,7 @@ use irpc::{
     LocalSender, RequestError, Service,
     channel::oneshot,
     rpc::{
-        ERROR_CODE_MAX_MESSAGE_SIZE_EXCEEDED, Handler, MAX_MESSAGE_SIZE, RemoteConnection,
+        ERROR_CODE_MAX_MESSAGE_SIZE_EXCEEDED, Handler, RemoteConnection, RemoteLimits,
         RemoteService,
     },
     util::AsyncReadVarintExt,
@@ -31,8 +31,17 @@ pub fn client<S: irpc::Service>(
     addr: impl Into<iroh::EndpointAddr>,
     alpn: impl AsRef<[u8]>,
 ) -> irpc::Client<S> {
+    client_with_limits(endpoint, addr, alpn, RemoteLimits::default())
+}
+
+pub fn client_with_limits<S: irpc::Service>(
+    endpoint: iroh::Endpoint,
+    addr: impl Into<iroh::EndpointAddr>,
+    alpn: impl AsRef<[u8]>,
+    limits: RemoteLimits,
+) -> irpc::Client<S> {
     let conn = IrohLazyRemoteConnection::new(endpoint, addr.into(), alpn.as_ref().to_vec());
-    irpc::Client::boxed(conn)
+    irpc::Client::boxed_with_limits(conn, limits)
 }
 
 /// Wrap an existing iroh connection as an irpc remote connection.
@@ -188,6 +197,7 @@ async fn connect_and_open_bi(
 pub struct IrohProtocol<S> {
     handler: Handler<S>,
     request_id: AtomicU64,
+    limits: RemoteLimits,
 }
 
 impl<T> fmt::Debug for IrohProtocol<T> {
@@ -201,15 +211,30 @@ impl<S: Service> IrohProtocol<S> {
     where
         S: RemoteService,
     {
-        let handler = S::remote_handler(local_sender.into());
-        Self::new(handler)
+        Self::with_sender_with_limits(local_sender, RemoteLimits::default())
+    }
+
+    pub fn with_sender_with_limits(
+        local_sender: impl Into<LocalSender<S>>,
+        limits: RemoteLimits,
+    ) -> Self
+    where
+        S: RemoteService,
+    {
+        let handler = S::remote_handler_with_limits(local_sender.into(), limits);
+        Self::new_with_limits(handler, limits)
     }
 
     /// Creates a new [`IrohProtocol`] for the `handler`.
     pub fn new(handler: Handler<S>) -> Self {
+        Self::new_with_limits(handler, RemoteLimits::default())
+    }
+
+    pub fn new_with_limits(handler: Handler<S>, limits: RemoteLimits) -> Self {
         Self {
             handler,
             request_id: Default::default(),
+            limits,
         }
     }
 }
@@ -218,7 +243,8 @@ impl<S: Service> ProtocolHandler for IrohProtocol<S> {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let handler = self.handler.clone();
         let request_id = self.request_id.fetch_add(1, Ordering::AcqRel);
-        let fut = handle_connection::<S>(&connection, handler).map_err(AcceptError::from_err);
+        let fut = handle_connection_with_limits::<S>(&connection, handler, self.limits)
+            .map_err(AcceptError::from_err);
         let span = trace_span!("rpc", id = request_id);
         fut.instrument(span).await
     }
@@ -233,6 +259,7 @@ impl<S: Service> ProtocolHandler for IrohProtocol<S> {
 pub struct Iroh0RttProtocol<S> {
     handler: Handler<S>,
     request_id: AtomicU64,
+    limits: RemoteLimits,
 }
 
 impl<T> fmt::Debug for Iroh0RttProtocol<T> {
@@ -246,15 +273,30 @@ impl<S: Service> Iroh0RttProtocol<S> {
     where
         S: RemoteService,
     {
-        let handler = S::remote_handler(local_sender.into());
-        Self::new(handler)
+        Self::with_sender_with_limits(local_sender, RemoteLimits::default())
+    }
+
+    pub fn with_sender_with_limits(
+        local_sender: impl Into<LocalSender<S>>,
+        limits: RemoteLimits,
+    ) -> Self
+    where
+        S: RemoteService,
+    {
+        let handler = S::remote_handler_with_limits(local_sender.into(), limits);
+        Self::new_with_limits(handler, limits)
     }
 
     /// Creates a new [`Iroh0RttProtocol`] for the `handler`.
     pub fn new(handler: Handler<S>) -> Self {
+        Self::new_with_limits(handler, RemoteLimits::default())
+    }
+
+    pub fn new_with_limits(handler: Handler<S>, limits: RemoteLimits) -> Self {
         Self {
             handler,
             request_id: Default::default(),
+            limits,
         }
     }
 }
@@ -264,7 +306,7 @@ impl<S: Service> ProtocolHandler for Iroh0RttProtocol<S> {
         let zrtt_conn = accepting.into_0rtt();
         let handler = self.handler.clone();
         let request_id = self.request_id.fetch_add(1, Ordering::AcqRel);
-        handle_connection::<S>(&zrtt_conn, handler)
+        handle_connection_with_limits::<S>(&zrtt_conn, handler, self.limits)
             .map_err(AcceptError::from_err)
             .instrument(trace_span!("rpc", id = request_id))
             .await?;
@@ -288,12 +330,21 @@ pub async fn handle_connection<S: Service>(
     connection: &impl IncomingRemoteConnection,
     handler: Handler<S>,
 ) -> io::Result<()> {
+    handle_connection_with_limits(connection, handler, RemoteLimits::default()).await
+}
+
+pub async fn handle_connection_with_limits<S: Service>(
+    connection: &impl IncomingRemoteConnection,
+    handler: Handler<S>,
+    limits: RemoteLimits,
+) -> io::Result<()> {
     if let Ok(remote) = connection.remote_id() {
         tracing::Span::current().record("remote", tracing::field::display(remote.fmt_short()));
     }
     debug!("connection accepted");
     loop {
-        let Some((msg, carrier, rx, tx)) = read_request_inner::<S>(connection).await? else {
+        let Some((msg, carrier, rx, tx)) = read_request_inner::<S>(connection, limits).await?
+        else {
             return Ok(());
         };
         irpc::span_propagation::scope_remote(carrier, handler(msg, rx, tx)).await?;
@@ -306,12 +357,19 @@ pub async fn handle_connection<S: Service>(
 pub async fn read_request<S: RemoteService>(
     connection: &impl IncomingRemoteConnection,
 ) -> std::io::Result<Option<S::Message>> {
-    let Some((msg, carrier, rx, tx)) = read_request_inner::<S>(connection).await? else {
+    read_request_with_limits::<S>(connection, RemoteLimits::default()).await
+}
+
+pub async fn read_request_with_limits<S: RemoteService>(
+    connection: &impl IncomingRemoteConnection,
+    limits: RemoteLimits,
+) -> std::io::Result<Option<S::Message>> {
+    let Some((msg, carrier, rx, tx)) = read_request_inner::<S>(connection, limits).await? else {
         return Ok(None);
     };
     Ok(Some(
         irpc::span_propagation::scope_remote(carrier, async move {
-            S::with_remote_channels(msg, rx, tx)
+            S::with_remote_channels_with_limits(msg, rx, tx, limits)
         })
         .await,
     ))
@@ -375,7 +433,14 @@ impl IncomingRemoteConnection for Connection {
 pub async fn read_request_raw<S: Service>(
     connection: &impl IncomingRemoteConnection,
 ) -> std::io::Result<Option<(S, RecvStream, SendStream)>> {
-    Ok(read_request_inner::<S>(connection)
+    read_request_raw_with_limits(connection, RemoteLimits::default()).await
+}
+
+pub async fn read_request_raw_with_limits<S: Service>(
+    connection: &impl IncomingRemoteConnection,
+    limits: RemoteLimits,
+) -> std::io::Result<Option<(S, RecvStream, SendStream)>> {
+    Ok(read_request_inner::<S>(connection, limits)
         .await?
         .map(|(msg, _carrier, rx, tx)| (msg, rx, tx)))
 }
@@ -385,6 +450,7 @@ pub async fn read_request_raw<S: Service>(
 /// The carrier is `Some` iff `S::SPAN_PROPAGATION` is true and the remote sent one.
 async fn read_request_inner<S: Service>(
     connection: &impl IncomingRemoteConnection,
+    limits: RemoteLimits,
 ) -> std::io::Result<
     Option<(
         S,
@@ -408,7 +474,7 @@ async fn read_request_inner<S: Service>(
         .read_varint_u64()
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "failed to read size"))?;
-    if size > MAX_MESSAGE_SIZE {
+    if size > limits.max_message_bytes {
         connection.close(
             ERROR_CODE_MAX_MESSAGE_SIZE_EXCEEDED.into(),
             b"request exceeded max message size",
@@ -436,6 +502,14 @@ async fn read_request_inner<S: Service>(
 ///
 /// The wire format used depends on `S::SPAN_PROPAGATION` - if true, span context is expected.
 pub async fn listen<S: Service>(endpoint: iroh::Endpoint, handler: Handler<S>) {
+    listen_with_limits(endpoint, handler, RemoteLimits::default()).await
+}
+
+pub async fn listen_with_limits<S: Service>(
+    endpoint: iroh::Endpoint,
+    handler: Handler<S>,
+    limits: RemoteLimits,
+) {
     let mut request_id = 0u64;
     let mut tasks = n0_future::task::JoinSet::new();
     loop {
@@ -454,10 +528,12 @@ pub async fn listen<S: Service>(endpoint: iroh::Endpoint, handler: Handler<S>) {
         let handler = handler.clone();
         let fut = async move {
             match incoming.await {
-                Ok(connection) => match handle_connection::<S>(&connection, handler).await {
-                    Err(err) => warn!("connection closed with error: {err:?}"),
-                    Ok(()) => debug!("connection closed"),
-                },
+                Ok(connection) => {
+                    match handle_connection_with_limits::<S>(&connection, handler, limits).await {
+                        Err(err) => warn!("connection closed with error: {err:?}"),
+                        Ok(()) => debug!("connection closed"),
+                    }
+                }
                 Err(cause) => {
                     warn!("failed to accept connection: {cause:?}");
                 }
