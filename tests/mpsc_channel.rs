@@ -10,6 +10,7 @@ use irpc::{
         SendError,
         mpsc::{self, Receiver, RecvError},
     },
+    rpc::RemoteLimits,
     util::AsyncWriteVarintExt,
 };
 use n0_error::e;
@@ -240,5 +241,59 @@ async fn mpsc_serialize_error_recv() -> TestResult<()> {
     assert!(
         matches!(cause, mpsc::RecvError::Io { source, .. } if source.kind() == ErrorKind::InvalidData)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn mpsc_remote_limit_send() -> TestResult<()> {
+    let (server, client, server_addr) = create_connected_endpoints()?;
+    let server = tokio::spawn(vec_receiver(server));
+    let conn = client.connect(server_addr, "localhost")?.await?;
+    let (send, _) = conn.open_bi().await?;
+    let send = mpsc::Sender::<Vec<u8>>::from((send, RemoteLimits::new(64 * 1024)));
+
+    let Err(cause) = send.send(vec![0u8; 64 * 1024 + 1]).await else {
+        panic!("client should have failed due to the configured remote limit");
+    };
+    assert!(matches!(cause, SendError::MaxMessageSizeExceeded { .. }));
+    let Err(cause) = server.await? else {
+        panic!("server should have failed due to the configured remote limit");
+    };
+    assert!(
+        matches!(cause, mpsc::RecvError::Io { source, .. } if source.kind() == ErrorKind::ConnectionReset)
+    );
+    Ok(())
+}
+
+async fn limited_vec_receiver(server: Endpoint) -> Result<(), RecvError> {
+    let conn = server
+        .accept()
+        .await
+        .unwrap()
+        .await
+        .map_err(|err| e!(RecvError::Io, err.into()))?;
+    let (_, recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|err| e!(RecvError::Io, err.into()))?;
+    let mut recv = Receiver::<Vec<u8>>::from((recv, RemoteLimits::new(64 * 1024)));
+    while recv.recv().await?.is_some() {}
+    Err(e!(RecvError::Io, io::ErrorKind::UnexpectedEof.into()))
+}
+
+#[tokio::test]
+async fn mpsc_remote_limit_recv() -> TestResult<()> {
+    let (server, client, server_addr) = create_connected_endpoints()?;
+    let server = tokio::spawn(limited_vec_receiver(server));
+    let conn = client.connect(server_addr, "localhost")?.await?;
+    let (mut send, _) = conn.open_bi().await?;
+    send.write_length_prefixed(vec![0u8; 64 * 1024 + 1])
+        .await
+        .ok();
+
+    let Err(cause) = server.await? else {
+        panic!("server should have failed due to the configured remote limit");
+    };
+    assert!(matches!(cause, mpsc::RecvError::MaxMessageSizeExceeded { .. }));
     Ok(())
 }
