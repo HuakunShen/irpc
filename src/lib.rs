@@ -2168,6 +2168,20 @@ pub mod rpc {
         }
     }
 
+    /// Decodes one value that must fill the whole declared frame: bytes left
+    /// after the value inside the frame are an error, not ignored.
+    fn from_exact_frame<T: DeserializeOwned>(frame: &[u8]) -> io::Result<T> {
+        let (msg, rest) = postcard::take_from_bytes(frame)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if !rest.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "trailing bytes inside a declared frame",
+            ));
+        }
+        Ok(msg)
+    }
+
     impl<T: DeserializeOwned> From<noq::RecvStream> for oneshot::Receiver<T> {
         fn from(mut read: noq::RecvStream) -> Self {
             let fut = async move {
@@ -2183,8 +2197,16 @@ pub mod rpc {
                     .read_to_end(size as usize)
                     .await
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                let msg: T = postcard::from_bytes(&rest)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                // `read_to_end` treats `size` as a limit; a body shorter than
+                // the declared length is a truncated frame, not a message.
+                if rest.len() as u64 != size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "response body shorter than its declared length",
+                    )
+                    .into());
+                }
+                let msg: T = from_exact_frame(&rest)?;
                 Ok(msg)
             };
             oneshot::Receiver::from(|| fut)
@@ -2290,8 +2312,7 @@ pub mod rpc {
                 read.read_exact(&mut buf)
                     .await
                     .map_err(|e| io::Error::new(io::ErrorKind::UnexpectedEof, e))?;
-                let msg: T = postcard::from_bytes(&buf)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let msg: T = from_exact_frame(&buf)?;
                 Ok(Some(msg))
             })
         }
